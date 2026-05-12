@@ -16,8 +16,10 @@ class DocumentResponse(BaseModel):
 
 class StatusResponse(BaseModel):
     doc_id: str
+    filename: str
     status: str
     chunk_count: Optional[int] = None
+    uploaded_at: Optional[datetime] = None
     error_message: Optional[str] = None
 
     model_config = {"from_attributes": True}
