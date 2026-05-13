@@ -18,7 +18,7 @@ from config import QDRANT_URL, QDRANT_API_KEY
 
 logger = logging.getLogger(__name__)
 
-_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=10)
 
 
 def ensure_collection(name: str, vector_size: int = 1536) -> None:
@@ -26,6 +26,9 @@ def ensure_collection(name: str, vector_size: int = 1536) -> None:
 
     This function will NEVER delete, recreate, or modify an existing
     collection.  It is safe to call on every startup.
+
+    If Qdrant is unreachable the app will still start — the collection
+    will be lazily created on the first ingestion request.
 
     Args:
         name: Collection name.
@@ -52,8 +55,10 @@ def ensure_collection(name: str, vector_size: int = 1536) -> None:
         )
         logger.info("✅  Qdrant collection '%s' created successfully.", name)
     except Exception as exc:
-        logger.error("❌  Qdrant ensure_collection failed: %s", exc)
-        raise RuntimeError(f"Qdrant ensure_collection failed: {exc}") from exc
+        logger.warning(
+            "⚠️  Qdrant unreachable during startup — collection '%s' will be "
+            "created lazily on first use.  Error: %s", name, exc,
+        )
 
 
 def insert_points(
