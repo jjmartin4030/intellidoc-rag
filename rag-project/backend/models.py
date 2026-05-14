@@ -23,3 +23,23 @@ class StatusResponse(BaseModel):
     error_message: Optional[str] = None
 
     model_config = {"from_attributes": True}
+
+
+class ChatRequest(BaseModel):
+    doc_id: str
+    question: str
+
+
+class ChunkResult(BaseModel):
+    chunk_index: int
+    text: str
+    score: float
+
+
+class ChatResponse(BaseModel):
+    answer: str
+    doc_id: str
+    filename: str
+    is_out_of_context: bool
+    source_chunks: list[ChunkResult]
+    top_score: float
