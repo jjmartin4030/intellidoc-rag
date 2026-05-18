@@ -5,21 +5,15 @@ from openai import OpenAI
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import select
 
-from qdrant_client.http.models import FieldCondition, MatchValue, Filter
-
 from config import OPENAI_API_KEY
 from database import async_session, Document
 from models import ChatRequest, ChatResponse, ChunkResult
-from services.embedder import embed_texts
-from services.qdrant_service import _client as qdrant_client
+from services.qdrant_service import hybrid_search
+from services.reranker import rerank_chunks
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/chat", tags=["chat"])
-
-QDRANT_COLLECTION = "sss"
-SCORE_THRESHOLD = 0.40
-TOP_K = 5
 
 _openai = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -34,6 +28,26 @@ SYSTEM_PROMPT = (
 
 OUT_OF_CONTEXT_ANSWER = "This question is outside the scope of the uploaded document."
 OUT_OF_CONTEXT_PHRASE = "outside the scope of the uploaded document"
+
+
+def is_out_of_context(chunks: list[dict]) -> bool:
+    """Dynamic thresholding based on cross-encoder rerank scores."""
+    if not chunks:
+        return True
+        
+    top_score = chunks[0].get("rerank_score", 0.0)
+    
+    if top_score < 0.20:
+        return True
+    if top_score >= 0.40:
+        return False
+        
+    if len(chunks) > 1:
+        gap = top_score - chunks[1].get("rerank_score", 0.0)
+        if gap > 0.05:
+            return False
+            
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -89,47 +103,13 @@ async def chat(req: ChatRequest):
     filename = doc.filename
     logger.info("📄  Document found — doc_id=%s, filename=%s, status=%s", doc_id, filename, doc.status)
 
-    # ── Step 1: Embed the question ────────────────────────────────────────
-    logger.info("🧠  Step 1/4 — Embedding question…")
+    # ── Step 1: Hybrid Search ─────────────────────────────────────────────
+    logger.info("🔍  Step 1/4 — Hybrid Search on Qdrant (doc_id=%s)…", doc_id)
     try:
-        question_vector = embed_texts([question])[0]
-        logger.info("🧠  Question embedded — dim=%d", len(question_vector))
+        search_results = hybrid_search(question, doc_id, top_k=10)
     except Exception as exc:
-        logger.error("❌  Failed to embed question: %s", exc)
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to embed question. Please try again later.",
-        )
-
-    # ── Step 2: Search Qdrant ─────────────────────────────────────────────
-    logger.info(
-        "🔍  Step 2/4 — Searching Qdrant collection '%s' (top_k=%d, filter=doc_id:%s)…",
-        QDRANT_COLLECTION, TOP_K, doc_id,
-    )
-    try:
-        query_response = qdrant_client.query_points(
-            collection_name=QDRANT_COLLECTION,
-            query=question_vector,
-            limit=TOP_K,
-            query_filter=Filter(
-                must=[
-                    FieldCondition(
-                        key="doc_id",
-                        match=MatchValue(value=doc_id),
-                    )
-                ]
-            ),
-        )
-        search_results = query_response.points
-        logger.info("🔍  Qdrant returned %d results.", len(search_results))
-    except Exception as exc:
-        logger.error("❌  Qdrant search failed: %s", exc)
-        raise HTTPException(
-            status_code=500,
-            detail="Vector search failed. Please try again later.",
-        )
-
-    # ── Step 3: Score check ───────────────────────────────────────────────
+        raise HTTPException(status_code=500, detail="Hybrid search failed.")
+        
     if not search_results:
         logger.info("⚠️  No chunks retrieved — returning out-of-context response.")
         return ChatResponse(
@@ -139,47 +119,53 @@ async def chat(req: ChatRequest):
             is_out_of_context=True,
             source_chunks=[],
             top_score=0.0,
+            top_rerank_score=0.0,
         )
+        
+    top_rrf_score = search_results[0].get("score", 0.0)
 
-    top_score = search_results[0].score
-    logger.info("📊  Top score: %.4f (threshold: %.2f)", top_score, SCORE_THRESHOLD)
-
-    # Build source_chunks for the response (sorted by chunk_index)
-    source_chunks = sorted(
-        [
-            ChunkResult(
-                chunk_index=hit.payload.get("chunk_index", 0),
-                text=hit.payload.get("text", ""),
-                score=round(hit.score, 4),
-            )
-            for hit in search_results
-        ],
-        key=lambda c: c.chunk_index,
-    )
-
-    if top_score < SCORE_THRESHOLD:
-        logger.info(
-            "⚠️  Top score %.4f < threshold %.2f — skipping LLM, returning out-of-context.",
-            top_score, SCORE_THRESHOLD,
+    # ── Step 2: Cross-encoder Reranking ───────────────────────────────────
+    logger.info("⚖️  Step 2/4 — Reranking %d chunks…", len(search_results))
+    reranked_chunks = rerank_chunks(question, search_results, top_n=5)
+    
+    top_rerank_score = reranked_chunks[0].get("rerank_score", 0.0)
+    
+    # Sort models by chunk_index for LLM context, but keeping rerank order is also fine.
+    # We will build context models sorted by chunk_index ascending for logical reading.
+    source_chunks_models = sorted([
+        ChunkResult(
+            chunk_index=c.get("chunk_index", 0),
+            text=c.get("text", ""),
+            score=c.get("score", 0.0),
+            rerank_score=c.get("rerank_score", 0.0),
         )
+        for c in reranked_chunks
+    ], key=lambda x: x.chunk_index)
+
+    # ── Step 3: Dynamic Threshold Check ───────────────────────────────────
+    logger.info("📊  Step 3/4 — Evaluating dynamic threshold (top_score=%.4f)…", top_rerank_score)
+    out_of_context = is_out_of_context(reranked_chunks)
+    
+    if out_of_context:
+        logger.info("⚠️  Rerank scores indicate out of context — skipping LLM.")
         return ChatResponse(
             answer=OUT_OF_CONTEXT_ANSWER,
             doc_id=doc_id,
             filename=filename,
             is_out_of_context=True,
-            source_chunks=source_chunks,
-            top_score=round(top_score, 4),
+            source_chunks=source_chunks_models,
+            top_score=top_rrf_score,
+            top_rerank_score=top_rerank_score,
         )
 
     # ── Step 4: Build context and call GPT-4o ─────────────────────────────
-    logger.info("📝  Step 3/4 — Building context from %d chunks…", len(source_chunks))
+    logger.info("📝  Step 4/4 — Building context and calling GPT-4o…")
     context_blocks = "\n".join(
-        f"[{i + 1}] {chunk.text}" for i, chunk in enumerate(source_chunks)
+        f"[{i + 1}] {chunk.text}" for i, chunk in enumerate(source_chunks_models)
     )
 
     user_message = f"Context:\n{context_blocks}\n\nQuestion: {question}"
 
-    logger.info("🤖  Step 4/4 — Calling GPT-4o (temperature=0, max_tokens=1000)…")
     try:
         completion = _openai.chat.completions.create(
             model="gpt-4o",
@@ -205,20 +191,21 @@ async def chat(req: ChatRequest):
         )
 
     # ── Detect out-of-context from LLM response ──────────────────────────
-    is_out_of_context = OUT_OF_CONTEXT_PHRASE in answer.lower()
-    if is_out_of_context:
+    llm_out_of_context = OUT_OF_CONTEXT_PHRASE in answer.lower()
+    if llm_out_of_context:
         logger.info("⚠️  LLM flagged answer as out-of-context.")
 
     logger.info(
-        "✅  Chat complete — doc_id=%s, is_out_of_context=%s, top_score=%.4f",
-        doc_id, is_out_of_context, top_score,
+        "✅  Chat complete — doc_id=%s, is_out_of_context=%s",
+        doc_id, llm_out_of_context,
     )
 
     return ChatResponse(
         answer=answer,
         doc_id=doc_id,
         filename=filename,
-        is_out_of_context=is_out_of_context,
-        source_chunks=source_chunks,
-        top_score=round(top_score, 4),
+        is_out_of_context=llm_out_of_context,
+        source_chunks=source_chunks_models,
+        top_score=round(top_rrf_score, 4),
+        top_rerank_score=round(top_rerank_score, 4),
     )

@@ -34,6 +34,7 @@ class ChunkResult(BaseModel):
     chunk_index: int
     text: str
     score: float
+    rerank_score: float
 
 
 class ChatResponse(BaseModel):
@@ -43,3 +44,4 @@ class ChatResponse(BaseModel):
     is_out_of_context: bool
     source_chunks: list[ChunkResult]
     top_score: float
+    top_rerank_score: float
